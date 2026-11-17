@@ -5,7 +5,7 @@ name: Build tariff rates
 on:
   push:
     branches: [main]
-    paths: [TRACKER_COMMIT, a1_revision.R, scripts/**, .github/**]
+    paths: [TRACKER_COMMIT, a1_revision.R, weights.R, scripts/**, .github/**]
   schedule:
     - cron: '17 9 * * 1'   # weekly: boundary revisions can appear as dates pass the last revision's horizon
   workflow_dispatch:
@@ -16,6 +16,10 @@ on:
         default: ''
       rebuild_all:
         description: Rebuild every revision
+        type: boolean
+        default: false
+      weights:
+        description: Rebuild the import weights even if nothing else changed
         type: boolean
         default: false
 
@@ -35,6 +39,7 @@ jobs:
       count: ${{ steps.plan.outputs.count }}
       orphans: ${{ steps.plan.outputs.orphans }}
       matrix: ${{ steps.plan.outputs.matrix }}
+      weights: ${{ steps.weights.outputs.weights }}
     steps:
       - uses: actions/checkout@v4
       - id: setup
@@ -64,6 +69,15 @@ jobs:
           all=(); [ "$REBUILD_ALL" = true ] && all=(--rebuild-all)
           python3 scripts/plan.py --revisions plan/revisions.csv --boundaries plan/boundaries.csv \
             --manifest plan/manifest.csv --assets plan/assets.txt --only "$ONLY" "${all[@]}" --out plan
+      # The weights are keyed to the tip revision's codes: rebuilt whenever any revision is (re)built, or if missing.
+      - id: weights
+        env:
+          COUNT: ${{ steps.plan.outputs.count }}
+          FORCE: ${{ inputs.weights }}
+        run: |
+          w=false
+          if [ "$COUNT" != 0 ] || [ "$FORCE" = true ] || ! grep -qx weights_meta.csv plan/assets.txt; then w=true; fi
+          echo "weights=$w" >> "$GITHUB_OUTPUT"; echo "weights: $w"
       - uses: actions/upload-artifact@v4
         with:
           name: plan
@@ -171,3 +185,46 @@ jobs:
           done < release/orphans.txt
           gh release edit "$TAG" --latest
           echo "published $TAG: $(($(wc -l < release/manifest.csv) - 1)) revisions" >> "$GITHUB_STEP_SUMMARY"
+
+  # 2024 Census imports by HS10 x country, keyed to the tip revision's codes by the tracker's own
+  # build_panel_import_weights() (484(f) transfers, 2025 split shares), as its published vintages carry.
+  weights:
+    needs: [plan, build, publish]
+    if: >
+      always() && needs.plan.result == 'success' && needs.plan.outputs.weights == 'true'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
+      && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+      - name: Census 2024 and 2025 imports
+        working-directory: ${{ steps.setup.outputs.tracker }}
+        run: |
+          Rscript src/io/build_import_weights.R --year 2024
+          Rscript src/io/build_import_weights.R --year 2025 --no-gtap
+          ls -la data/weights
+      - name: Key the weights to the tip revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          TRACKER: ${{ steps.setup.outputs.tracker }}
+        run: |
+          mkdir -p tip
+          gh release download "$TAG" -p manifest.csv -D tip
+          tipfile=$(python3 -c "import csv; r=max(csv.DictReader(open('tip/manifest.csv')), key=lambda m: m['effective_date']); print(r['file'])")
+          gh release download "$TAG" -p "$tipfile" -D tip
+          Rscript weights.R --tracker "$TRACKER" --release tip --out weights
+          cat weights/weights_meta.csv
+          ls -la weights
+      - name: Publish the weights
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          shopt -s nullglob
+          files=(weights/import_weights_hs10_country.parquet weights/weights_meta.csv weights/*crosswalk*.csv)
+          gh release upload "$TAG" "${files[@]}" --clobber
+          echo "weights: $(tail -1 weights/weights_meta.csv)" >> "$GITHUB_STEP_SUMMARY"

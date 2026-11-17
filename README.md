@@ -25,6 +25,13 @@ One release per tracker commit and driver version, tagged `rates-<tracker commit
   interval where a Chapter 99 entry starts or ends, or one of the tracker's configured policy dates, built from its
   owner revision's archive), `effective_date`, `archive_rev_id`, `rows`, build `seconds`, `peak_rss_mb`,
   `tracker_commit`, `driver_hash`, `bytes`, `sha256` and the run that built it.
+- `import_weights_hs10_country.parquet`: 2024 Census consumption imports by HTS-10 × country (`hts10`, `country`,
+  `imports` in dollars), keyed to the tip revision's product codes by the tracker's own `build_panel_import_weights()`
+  (its 484(f) transfer crosswalk moves value on retired statistical suffixes to their successors; 2025 imports give
+  the split shares), the file the tracker publishes with each vintage. `weights_meta.csv` records the tip revision, its
+  HTS identity date, totals and the SHA-256 of the Census bases; the forward map is in the crosswalk CSV beside it.
+  Census's monthly IMDB files are downloaded fresh by the tracker's `build_import_weights.R`. Rebuilt whenever any
+  revision is.
 - `LICENSE-tariff-rate-tracker.txt`: the tracker's MIT License, which covers these derived files.
 
 Effective dates are the tracker's policy-effective dates (its default, not `--use-hts-dates`). A revision's rates apply
