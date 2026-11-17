@@ -1,0 +1,31 @@
+name: Check the tracker for updates
+
+# Weekly: if Budget Lab's tariff-rate-tracker has commits past the pinned one, open (or update) one issue. Moving to
+# a newer commit stays a deliberate change: edit TRACKER_COMMIT, which rebuilds every revision into a new release.
+on:
+  schedule:
+    - cron: '41 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pinned=$(tr -d '[:space:]' < TRACKER_COMMIT)
+          head=$(git ls-remote https://github.com/Budget-Lab-Yale/tariff-rate-tracker HEAD | cut -f1)
+          echo "pinned $pinned, upstream $head"
+          [ "$pinned" = "$head" ] && exit 0
+          title="Tariff tracker has new commits"
+          body="Upstream is at \`${head:0:7}\`; we build \`${pinned:0:7}\`.
+          Changes: https://github.com/Budget-Lab-Yale/tariff-rate-tracker/compare/${pinned}...${head}
+          To move to it, set TRACKER_COMMIT to \`${head}\` after reviewing the changes."
+          n=$(gh issue list --state open --search "in:title \"$title\"" --json number -q '.[0].number')
+          if [ -n "$n" ]; then gh issue edit "$n" --body "$body"; else gh issue create --title "$title" --body "$body"; fi

@@ -1,0 +1,173 @@
+name: Build tariff rates
+
+# One job per tracker revision (GitHub's standard Linux runners: 4 cores, 16 GB; a revision peaks near 10 GB), then
+# one release per tracker commit and driver version holding every revision's Parquet file and a manifest.
+on:
+  push:
+    branches: [main]
+    paths: [TRACKER_COMMIT, a1_revision.R, scripts/**, .github/**]
+  schedule:
+    - cron: '17 9 * * 1'   # weekly: boundary revisions can appear as dates pass the last revision's horizon
+  workflow_dispatch:
+    inputs:
+      revisions:
+        description: Revisions to rebuild, space-separated (blank = only what is missing or stale)
+        required: false
+        default: ''
+      rebuild_all:
+        description: Rebuild every revision
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-rates
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.setup.outputs.tag }}
+      commit: ${{ steps.setup.outputs.commit }}
+      count: ${{ steps.plan.outputs.count }}
+      orphans: ${{ steps.plan.outputs.orphans }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+      - name: List the tracker's revisions
+        env:
+          TRACKER: ${{ steps.setup.outputs.tracker }}
+        run: |
+          mkdir -p plan
+          Rscript a1_revision.R --tracker "$TRACKER" --out "$RUNNER_TEMP/a1" --list > plan/revisions.csv
+          Rscript a1_revision.R --tracker "$TRACKER" --out "$RUNNER_TEMP/a1" --boundaries > plan/boundaries.csv
+      - name: Read the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.setup.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --json assets -q '.assets[].name' > plan/assets.txt 2>/dev/null; then
+            gh release download "$TAG" -p manifest.csv -D plan || true
+          else
+            : > plan/assets.txt
+          fi
+      - id: plan
+        env:
+          ONLY: ${{ inputs.revisions }}
+          REBUILD_ALL: ${{ inputs.rebuild_all }}
+        run: |
+          all=(); [ "$REBUILD_ALL" = true ] && all=(--rebuild-all)
+          python3 scripts/plan.py --revisions plan/revisions.csv --boundaries plan/boundaries.csv \
+            --manifest plan/manifest.csv --assets plan/assets.txt --only "$ONLY" "${all[@]}" --out plan
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan/
+          retention-days: 7
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: build ${{ matrix.revision }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: setup
+        uses: ./.github/actions/setup
+      - name: Build ${{ matrix.revision }}
+        env:
+          TRACKER: ${{ steps.setup.outputs.tracker }}
+          REV: ${{ matrix.revision }}
+          KIND: ${{ matrix.kind }}
+          OWNER: ${{ matrix.owner }}
+          DATE: ${{ matrix.effective_date }}
+        run: |
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          extra=()
+          [ "$KIND" = boundary ] && extra=(--owner "$OWNER" --date "$DATE")
+          free -m | head -2
+          /usr/bin/time -v -o "$out/peak_$REV.txt" \
+            Rscript a1_revision.R --tracker "$TRACKER" --out "$out" --revision "$REV" "${extra[@]}"
+          grep -E "Maximum resident set size|Elapsed \(wall clock\)" "$out/peak_$REV.txt"
+          ls -la "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rev-${{ matrix.revision }}
+          path: |
+            ${{ runner.temp }}/out/rates_*.parquet
+            ${{ runner.temp }}/out/meta_*.csv
+            ${{ runner.temp }}/out/peak_*.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [plan, build]
+    if: >
+      always() && needs.plan.result == 'success'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
+      && (needs.plan.outputs.count != '0' || needs.plan.outputs.orphans != '0')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: plan
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rev-*
+          path: built
+          merge-multiple: true
+      - name: Check and write the manifest
+        env:
+          COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          mkdir -p built
+          python3 scripts/manifest.py --required plan/required.csv --old-manifest plan/manifest.csv \
+            --built built --driver-hash "$(git hash-object a1_revision.R | cut -c1-7)" --tracker-commit "$COMMIT" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --out release
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/Budget-Lab-Yale/tariff-rate-tracker/$COMMIT/LICENSE" \
+            -o release/LICENSE-tariff-rate-tracker.txt
+          {
+            echo "Tariff rates by HTS product and country for every revision of the Budget Lab at Yale's"
+            echo "[tariff-rate-tracker](https://github.com/Budget-Lab-Yale/tariff-rate-tracker) at commit"
+            echo "[\`${COMMIT:0:7}\`](https://github.com/Budget-Lab-Yale/tariff-rate-tracker/tree/$COMMIT),"
+            echo "built one revision at a time by its own \`build_revision_snapshot()\`, unmodified."
+            echo "\`manifest.csv\` lists each file with its effective date, owner archive, row count and SHA-256."
+            echo
+            echo "These files are derived from tariff-rate-tracker, used under its MIT License:"
+            echo
+            echo '```'
+            cat release/LICENSE-tariff-rate-tracker.txt
+            echo '```'
+          } > notes.md
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "Rates, tracker ${COMMIT:0:7}" --notes-file notes.md
+          else
+            gh release edit "$TAG" --notes-file notes.md
+          fi
+          files=(release/manifest.csv release/LICENSE-tariff-rate-tracker.txt)
+          shopt -s nullglob
+          files+=(built/rates_*.parquet)
+          gh release upload "$TAG" "${files[@]}" --clobber
+          while read -r f; do
+            [ -n "$f" ] && gh release delete-asset "$TAG" "$f" -y
+          done < release/orphans.txt
+          gh release edit "$TAG" --latest
+          echo "published $TAG: $(($(wc -l < release/manifest.csv) - 1)) revisions" >> "$GITHUB_STEP_SUMMARY"
