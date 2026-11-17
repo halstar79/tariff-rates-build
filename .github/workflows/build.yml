@@ -200,6 +200,21 @@ jobs:
       - uses: actions/checkout@v4
       - id: setup
         uses: ./.github/actions/setup
+      # The tracker's builder downloads with R's 60-second default timeout, too short for Census's ~60 MB monthly
+      # files from these runners; it uses ZIPs already in data/weights/raw/<year>/ (its documented manual path).
+      - name: Download Census's monthly import files
+        working-directory: ${{ steps.setup.outputs.tracker }}
+        run: |
+          for year in 2024 2025; do
+            mkdir -p "data/weights/raw/$year"
+            for mm in 01 02 03 04 05 06 07 08 09 10 11 12; do
+              f="IMDB${year:2:2}${mm}.ZIP"
+              curl -fsS --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 30 --max-time 1200 \
+                -o "data/weights/raw/$year/$f" -w "$f %{http_code} %{size_download} bytes %{time_total}s\n" \
+                "https://www.census.gov/trade/downloads/$year/Merch/im_m/$f"
+              unzip -l "data/weights/raw/$year/$f" | grep -qi IMP_DETL || { echo "$f is not an IMP_DETL zip"; exit 1; }
+            done
+          done
       - name: Census 2024 and 2025 imports
         working-directory: ${{ steps.setup.outputs.tracker }}
         run: |
